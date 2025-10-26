@@ -61,12 +61,11 @@ public class ThirdPartyController {
             String requestBody = objectMapper.writeValueAsString(billRequest);
 
             PublicKey key = SignatureUtils.loadPublicKeyFromResource("public_decscript_enc.pem", "SHA256withRSA");
-            byte[] encrypt = SignatureUtils.rsaEncryptOaep(
+            String base64Encrypt = SignatureUtils.hybridEncrypt(
                     key,
-                    requestBody.getBytes(StandardCharsets.UTF_8)
+                    requestBody.getBytes(),
+                    null
             );
-
-            String base64Encrypt = Base64.getEncoder().encodeToString(encrypt);
 
             System.out.println("Ma hoa: " + base64Encrypt);
 
