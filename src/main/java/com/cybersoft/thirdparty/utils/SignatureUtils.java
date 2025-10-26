@@ -6,7 +6,13 @@ import java.security.interfaces.RSAPrivateKey;
 import java.security.interfaces.RSAPublicKey;
 import java.security.spec.*;
 import java.util.Base64;
+import javax.crypto.Cipher;
+import javax.crypto.KeyGenerator;
 import javax.crypto.Mac;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.OAEPParameterSpec;
+import javax.crypto.spec.PSource;
 import javax.crypto.spec.SecretKeySpec;
 
 import org.bouncycastle.openssl.PEMParser;
@@ -209,5 +215,157 @@ public final class SignatureUtils {
             if ("DSA".equalsIgnoreCase(key.getAlgorithm())) return "SHA256withDSA";
             return "SHA256withRSA";
         }
+
+        // ===================== AES-GCM (symmetric) =====================
+
+        /**
+         * Generate a random AES key (in bytes) with given keySizeBits (128 or 256).
+         */
+        public static byte[] generateAesKey(int keySizeBits) throws NoSuchAlgorithmException {
+            if (keySizeBits != 128 && keySizeBits != 192 && keySizeBits != 256) {
+                throw new IllegalArgumentException("Unsupported AES key size: " + keySizeBits);
+            }
+            KeyGenerator kg = KeyGenerator.getInstance("AES");
+            kg.init(keySizeBits, SecureRandom.getInstanceStrong());
+            SecretKey sk = kg.generateKey();
+            return sk.getEncoded();
+        }
+
+        /**
+         * Encrypt plaintext with AES-GCM. Returns a Base64 string containing iv:ciphertext (iv and ciphertext are Base64, separated by '.').
+         * iv length is 12 bytes (recommended).
+         */
+        public static String encryptAesGcm(byte[] aesKey, byte[] plaintext, byte[] associatedData) throws Exception {
+            byte[] iv = new byte[12];
+            SecureRandom.getInstanceStrong().nextBytes(iv);
+
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            SecretKeySpec keySpec = new SecretKeySpec(aesKey, "AES");
+            GCMParameterSpec gcmSpec = new GCMParameterSpec(128, iv); // 128-bit auth tag
+            cipher.init(Cipher.ENCRYPT_MODE, keySpec, gcmSpec);
+            if (associatedData != null) cipher.updateAAD(associatedData);
+
+            byte[] ciphertext = cipher.doFinal(plaintext);
+
+            String ivB64 = Base64.getEncoder().encodeToString(iv);
+            String ctB64 = Base64.getEncoder().encodeToString(ciphertext);
+            return ivB64 + "." + ctB64;
+        }
+
+        /**
+         * Decrypt AES-GCM output produced by encryptAesGcm.
+         * input format: ivBase64.ciphertextBase64
+         */
+        public static byte[] decryptAesGcm(byte[] aesKey, String ivAndCiphertext, byte[] associatedData) throws Exception {
+            String[] parts = ivAndCiphertext.split("\\.", 2);
+            if (parts.length != 2) throw new IllegalArgumentException("Invalid AES-GCM input format");
+            byte[] iv = Base64.getDecoder().decode(parts[0]);
+            byte[] ciphertext = Base64.getDecoder().decode(parts[1]);
+
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            SecretKeySpec keySpec = new SecretKeySpec(aesKey, "AES");
+            GCMParameterSpec gcmSpec = new GCMParameterSpec(128, iv);
+            cipher.init(Cipher.DECRYPT_MODE, keySpec, gcmSpec);
+            if (associatedData != null) cipher.updateAAD(associatedData);
+            return cipher.doFinal(ciphertext);
+        }
+
+        // ===================== RSA OAEP (asymmetric) =====================
+
+        /**
+         * Encrypt small data (e.g., AES key) with RSA OAEP (SHA-256).
+         */
+        public static byte[] rsaEncryptOaep(PublicKey publicKey, byte[] data) throws Exception {
+            Cipher cipher = Cipher.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding");
+            // explicit OAEP params (optional but clearer)
+            OAEPParameterSpec oaepParams = new OAEPParameterSpec(
+                    "SHA-256",
+                    "MGF1",
+                    new MGF1ParameterSpec("SHA-256"),
+                    PSource.PSpecified.DEFAULT
+            );
+            cipher.init(Cipher.ENCRYPT_MODE, publicKey);
+            // Some JDKs accept cipher.init with OAEPParameterSpec; if needed: cipher = Cipher.getInstance(..., "BC") after adding BC
+            return cipher.doFinal(data);
+        }
+
+        /**
+         * Decrypt RSA OAEP encrypted data with private key.
+         */
+        public static byte[] rsaDecryptOaep(PrivateKey privateKey, byte[] encrypted) throws Exception {
+            Cipher cipher = Cipher.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding");
+            cipher.init(Cipher.DECRYPT_MODE, privateKey);
+            return cipher.doFinal(encrypted);
+        }
+
+        // ===================== HYBRID (RSA + AES-GCM) =====================
+
+        /**
+         * Hybrid encrypt: generate AES key, encrypt plaintext with AES-GCM, encrypt AES key with RSA-OAEP.
+         * Returns a String: "hybrid:<encKeyBase64>.<ivBase64>.<ciphertextBase64>"
+         *
+         * Note: RSA can only encrypt small data (size < keySizeBytes - overhead). We only encrypt the AES key.
+         */
+        public static String hybridEncrypt(PublicKey rsaPublicKey, byte[] plaintext, byte[] associatedData) throws Exception {
+            // 1) generate AES key (256 bits recommended)
+            byte[] aesKey;
+            try {
+                aesKey = generateAesKey(256);
+            } catch (NoSuchAlgorithmException e) {
+                // fallback to 128 if 256 not allowed
+                aesKey = generateAesKey(128);
+            }
+
+            // 2) encrypt plaintext with AES-GCM
+            String ivAndCiphertext = encryptAesGcm(aesKey, plaintext, associatedData); // returns iv.ct
+
+            // 3) encrypt AES key with RSA-OAEP
+            byte[] encKey = rsaEncryptOaep(rsaPublicKey, aesKey);
+
+            String encKeyB64 = Base64.getEncoder().encodeToString(encKey);
+            // ivAndCiphertext already in form ivB64.ctB64
+            return "hybrid:" + encKeyB64 + "." + ivAndCiphertext;
+        }
+
+        /**
+         * Hybrid decrypt: input the hybrid string returned by hybridEncrypt.
+         * Returns decrypted plaintext bytes.
+         */
+        public static byte[] hybridDecrypt(PrivateKey rsaPrivateKey, String hybridInput, byte[] associatedData) throws Exception {
+            if (!hybridInput.startsWith("hybrid:")) {
+                throw new IllegalArgumentException("Invalid hybrid format");
+            }
+            String payload = hybridInput.substring("hybrid:".length());
+            // first part is encKeyB64, remaining is iv.ct (where iv and ct separated by '.')
+            int firstDot = payload.indexOf('.');
+            if (firstDot <= 0) throw new IllegalArgumentException("Invalid hybrid payload");
+
+            String encKeyB64 = payload.substring(0, firstDot);
+            String rest = payload.substring(firstDot + 1); // iv.ct
+
+            byte[] encKey = Base64.getDecoder().decode(encKeyB64);
+            // decrypt AES key with RSA
+            byte[] aesKey = rsaDecryptOaep(rsaPrivateKey, encKey);
+
+            // decrypt AES-GCM payload
+            return decryptAesGcm(aesKey, rest, associatedData);
+        }
+
+        // ===================== Helper for text convenience =====================
+
+        public static String encryptAesGcmToBase64String(byte[] aesKey, String plaintext, String aad) throws Exception {
+            byte[] pt = plaintext.getBytes(StandardCharsets.UTF_8);
+            byte[] aadBytes = aad != null ? aad.getBytes(StandardCharsets.UTF_8) : null;
+            return encryptAesGcm(aesKey, pt, aadBytes);
+        }
+
+        public static String decryptAesGcmToString(byte[] aesKey, String ivAndCtBase64, String aad) throws Exception {
+            byte[] aadBytes = aad != null ? aad.getBytes(StandardCharsets.UTF_8) : null;
+            byte[] pt = decryptAesGcm(aesKey, ivAndCtBase64, aadBytes);
+            return new String(pt, StandardCharsets.UTF_8);
+        }
+
+
+
     }
 
